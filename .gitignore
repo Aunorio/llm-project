@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.vs/
 .ruff_cache/
 .venv/
 .env
