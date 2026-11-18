@@ -2,7 +2,9 @@
 
 from collections.abc import Callable
 
-from assistant.infra.erp_client import ErpClient
+from assistant.graphrag.search import global_search, local_search
+from assistant.infra.erp_client import ErpClient, ErpNotFound, ErpRejected
+from assistant.infra.grounding import code_type, normalize_code
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import KnowledgeBase
 
@@ -102,4 +104,98 @@ def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, 
     оставались различимыми. `ErpUnavailable` передаётся дальше: повторы делает агент (FR-8).
     """
     # TODO: пять функций поверх local_search, global_search и клиента ERP
-    raise NotImplementedError("Реализуйте build_tools")
+    def validate_part_id(part_id: str) -> tuple[str | None, dict | None]:
+        if not isinstance(part_id, str):
+            return None, {"error": "номер детали должен быть строкой"}
+
+        code = normalize_code(part_id)
+        if code is None or code_type(code) != "Part":
+            return None, {
+                "error": f"номер детали должен быть вида P-1042 или P-1042B, получено: {part_id!r}"
+            }
+
+        return code, None
+
+    def validate_warehouse(warehouse: str) -> dict | None:
+        if warehouse not in WAREHOUSES:
+            return {
+                "error": f"неизвестный склад {warehouse!r}: выберите один из {', '.join(WAREHOUSES)}"
+            }
+        return None
+
+    def search_knowledge(question: str) -> dict:
+        answer = local_search(question, kb, llm)
+        return {
+            "answer": answer.text,
+            "facts": answer.facts,
+            "sources": answer.sources,
+            "refused": answer.refused,
+        }
+
+    def summarize_topic(question: str) -> dict:
+        answer = global_search(question, kb, llm)
+        return {
+            "answer": answer.text,
+            "sources": answer.sources,
+            "refused": answer.refused,
+        }
+
+    def check_stock(part_id: str, warehouse: str) -> dict:
+        code, error = validate_part_id(part_id)
+        if error:
+            return error
+
+        error = validate_warehouse(warehouse)
+        if error:
+            return error
+
+        try:
+            return erp.get_stock(code, warehouse)
+        except ErpNotFound:
+            return {"error": f"деталь {code} в ERP не найдена: данных нет"}
+        except ErpRejected as exc:
+            return {"error": f"запрос отклонён ERP: {exc}"}
+
+    def get_price(part_id: str) -> dict:
+        code, error = validate_part_id(part_id)
+        if error:
+            return error
+
+        try:
+            return erp.get_price(code)
+        except ErpNotFound:
+            return {"error": f"деталь {code} в ERP не найдена: данных нет"}
+        except ErpRejected as exc:
+            return {"error": f"запрос отклонён ERP: {exc}"}
+
+    def create_service_order(part_id: str, warehouse: str, qty: int, model: str) -> dict:
+        code, error = validate_part_id(part_id)
+        if error:
+            return error
+
+        error = validate_warehouse(warehouse)
+        if error:
+            return error
+
+        if not isinstance(qty, int) or isinstance(qty, bool) or qty <= 0:
+            return {
+                "error": f"количество должно быть целым числом больше нуля, получено: {qty!r}"
+            }
+
+        if not isinstance(model, str) or not model.strip():
+            return {"error": "необходимо указать модель"}
+
+        try:
+            return erp.create_order(code, warehouse, qty, model)
+        except ErpNotFound:
+            return {"error": f"деталь {code} в ERP не найдена: данных нет"}
+        except ErpRejected as exc:
+            return {"error": f"заказ отклонён ERP: {exc}"}
+
+    return {
+        "search_knowledge": search_knowledge,
+        "summarize_topic": summarize_topic,
+        "check_stock": check_stock,
+        "get_price": get_price,
+        "create_service_order": create_service_order,
+    }
