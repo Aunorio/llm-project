@@ -65,9 +65,7 @@ TOOL_SCHEMAS: list[dict] = [
             "description": "Возвращает цену детали в рублях и признак снятия с производства.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "part_id": {"type": "string", "description": "номер детали вида P-1042 или P-1042B"}
-                },
+                "properties": {"part_id": {"type": "string", "description": "номер детали вида P-1042 или P-1042B"}},
                 "required": ["part_id"],
             },
         },
@@ -103,6 +101,7 @@ def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, 
     `ErpNotFound` и `ErpRejected` превращаются в {"error": "..."} с разным текстом, чтобы исходы
     оставались различимыми. `ErpUnavailable` передаётся дальше: повторы делает агент (FR-8).
     """
+
     # TODO: пять функций поверх local_search, global_search и клиента ERP
     def validate_part_id(part_id: str) -> tuple[str | None, dict | None]:
         if not isinstance(part_id, str):
@@ -110,17 +109,13 @@ def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, 
 
         code = normalize_code(part_id)
         if code is None or code_type(code) != "Part":
-            return None, {
-                "error": f"номер детали должен быть вида P-1042 или P-1042B, получено: {part_id!r}"
-            }
+            return None, {"error": f"номер детали должен быть вида P-1042 или P-1042B, получено: {part_id!r}"}
 
         return code, None
 
     def validate_warehouse(warehouse: str) -> dict | None:
         if warehouse not in WAREHOUSES:
-            return {
-                "error": f"неизвестный склад {warehouse!r}: выберите один из {', '.join(WAREHOUSES)}"
-            }
+            return {"error": f"неизвестный склад {warehouse!r}: выберите один из {', '.join(WAREHOUSES)}"}
         return None
 
     def search_knowledge(question: str) -> dict:
@@ -178,9 +173,7 @@ def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, 
             return error
 
         if not isinstance(qty, int) or isinstance(qty, bool) or qty <= 0:
-            return {
-                "error": f"количество должно быть целым числом больше нуля, получено: {qty!r}"
-            }
+            return {"error": f"количество должно быть целым числом больше нуля, получено: {qty!r}"}
 
         if not isinstance(model, str) or not model.strip():
             return {"error": "необходимо указать модель"}
