@@ -15,19 +15,21 @@ from assistant.infra.schemas import (
     Relation,
 )
 
+MAX_TEXT_LENGTH = 500
+
 SYSTEM_PROMPT = """
 Ты извлекаешь сущности и связи из документов сервисной службы.
 
 Используй исключительно информацию, которая прямо подтверждается текстом.
 
 Допустимые типы сущностей:
-- ProductLine — линейка оборудования;
-- Model — модель оборудования;
-- Component — узел оборудования;
-- Part — номер детали;
-- ErrorCode — код ошибки;
-- Procedure — номер регламента;
-- Supplier — поставщик.
+- ProductLine - линейка оборудования;
+- Model - модель оборудования;
+- Component - узел оборудования;
+- Part - номер детали;
+- ErrorCode - код ошибки;
+- Procedure - номер регламента;
+- Supplier - поставщик.
 
 Допустимые связи и их направление:
 
@@ -60,40 +62,102 @@ SYSTEM_PROMPT = """
 Коды переписывай в каноническом виде.
 Названия узлов, линеек и поставщиков используй в именительном падеже.
 
-Верни только JSON с двумя массивами: entities и relations.
+ВАЖНЫЕ ПРАВИЛА ИЗВЛЕЧЕНИЯ:
+
+1. Если в тексте указано, что в модели установлен определённый узел,
+   а рядом записан номер детали, создавай HAS_PART:
+   Model -> Part.
+
+2. Если строка имеет вид:
+   "компрессор - деталь P-1010",
+   то "компрессор" - это Component,
+   а "P-1010" - это Part.
+   Создавай IS_A:
+   Part -> Component.
+
+3. Если в той же строке указан поставщик,
+   создавай SUPPLIED_BY:
+   Part -> Supplier.
+
+4. Если во фрагменте нет повторного упоминания модели,
+   но в переданном контексте указано, что перечисленные узлы
+   установлены в определённой модели, используй эту модель
+   для создания HAS_PART.
+
+5. Для каждой строки состава узлов извлекай все связи,
+   которые подтверждаются этой строкой и контекстом:
+   HAS_PART, IS_A и SUPPLIED_BY.
+
+6. Внимательно проверяй направление каждой связи.
+   HAS_PART - Model -> Part.
+   IS_A - Part -> Component.
+   SUPPLIED_BY - Part -> Supplier.
 
 Пример:
 
 Текст:
-"Модель AR-210 входит в линейку Арктика.
-В модели установлена деталь P-1042."
+"Модель AR-210.
+В AR-210 установлены следующие узлы:
+пусковое реле - деталь P-1042,
+поставщик ХолодКомплект."
 
 Ответ:
 {
   "entities": [
     {"type": "Model", "name": "AR-210"},
-    {"type": "ProductLine", "name": "Арктика"},
-    {"type": "Part", "name": "P-1042"}
+    {"type": "Component", "name": "пусковое реле"},
+    {"type": "Part", "name": "P-1042"},
+    {"type": "Supplier", "name": "ХолодКомплект"}
   ],
   "relations": [
-    {
-      "subject_type": "Model",
-      "subject": "AR-210",
-      "type": "BELONGS_TO",
-      "object_type": "ProductLine",
-      "object": "Арктика"
-    },
     {
       "subject_type": "Model",
       "subject": "AR-210",
       "type": "HAS_PART",
       "object_type": "Part",
       "object": "P-1042"
+    },
+    {
+      "subject_type": "Part",
+      "subject": "P-1042",
+      "type": "IS_A",
+      "object_type": "Component",
+      "object": "пусковое реле"
+    },
+    {
+      "subject_type": "Part",
+      "subject": "P-1042",
+      "type": "SUPPLIED_BY",
+      "object_type": "Supplier",
+      "object": "ХолодКомплект"
     }
   ]
 }
-"""
 
+Другой пример:
+
+Текст:
+"Деталь P-1042 заменена на P-1042B."
+
+Ответ:
+{
+  "entities": [
+    {"type": "Part", "name": "P-1042"},
+    {"type": "Part", "name": "P-1042B"}
+  ],
+  "relations": [
+    {
+      "subject_type": "Part",
+      "subject": "P-1042",
+      "type": "REPLACED_BY",
+      "object_type": "Part",
+      "object": "P-1042B"
+    }
+  ]
+}
+
+Верни только JSON с двумя массивами: entities и relations.
+"""
 
 def empty_result(chunk: Chunk) -> ExtractionResult:
     """Создаёт пустой результат, сохраняя идентификаторы чанка."""
@@ -140,10 +204,109 @@ def parse_response(content: str) -> dict | None:
         if not isinstance(item, dict):
             return None
 
-        if any(not isinstance(item.get(field), str) for field in required_relation_fields):
+        if any(
+            not isinstance(item.get(field), str)
+            for field in required_relation_fields
+        ):
             return None
 
     return data
+
+def get_context_lines(lines: list[str]) -> list[str]:
+    """
+    Выбирает строки, которые нужно повторять в каждом фрагменте.
+    Сохраняет заголовок документа, описание состава узлов
+    и предложение, связывающее узлы с моделью.
+    """
+    context = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        if not stripped:
+            continue
+
+        lowered = stripped.casefold()
+
+        if stripped.startswith("#"):
+            context.append(line)
+            continue
+
+        if "состав узлов" in lowered:
+            context.append(line)
+            continue
+
+        if any(
+            word in lowered
+            for word in (
+                "установлен",
+                "установлены",
+                "установлена",
+                "установлено",
+            )
+        ):
+            context.append(line)
+
+    if not context:
+        for line in lines:
+            if line.strip():
+                context.append(line)
+                break
+
+    return context
+
+def split_text(text: str) -> list[str]:
+    """Делит чанк на фрагменты с сохранением контекста."""
+    if len(text) <= MAX_TEXT_LENGTH:
+        return [text]
+
+    lines = text.splitlines()
+
+    if len(lines) <= 1:
+        return [
+            text[i:i + MAX_TEXT_LENGTH]
+            for i in range(0, len(text), MAX_TEXT_LENGTH)
+        ]
+
+    context = get_context_lines(lines)
+    context_set = set(context)
+
+    body = [
+        line
+        for line in lines
+        if line not in context_set and line.strip()
+    ]
+
+    context_text = "\n".join(context)
+    context_length = len(context_text) + 1
+
+    parts = []
+    current_lines = []
+    current_length = context_length
+
+    for line in body:
+        line_length = len(line) + 1
+
+        if (
+            current_lines
+            and current_length + line_length > MAX_TEXT_LENGTH
+        ):
+            parts.append(
+                context_text + "\n" + "\n".join(current_lines)
+            )
+
+            current_lines = []
+            current_length = context_length
+
+        current_lines.append(line)
+        current_length += line_length
+
+    if current_lines:
+        parts.append(
+            context_text + "\n" + "\n".join(current_lines)
+        )
+
+    return parts or [text]
 
 def ground_entity(
     entity_type: str,
@@ -153,7 +316,6 @@ def ground_entity(
     words: dict[str, list[str]],
 ) -> Entity | None:
     """Проверяет сущность по исходному тексту и возвращает её канонический вариант."""
-
     if entity_type not in ENTITY_TYPES:
         return None
 
@@ -171,33 +333,59 @@ def ground_entity(
 
     return Entity(entity_type, canonical)
 
-def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
-    """Возвращает сущности и связи чанка строго по схеме графа.
-
-    Модель вызывается через `llm.chat(..., json_schema=EXTRACTION_SCHEMA)`. Запрос описывает схему
-    с направлением каждой связи и содержит хотя бы один пример. Всё, что не подтверждается текстом,
-    отбрасывается и считается в `dropped`: код, которого нет в чанке, название не из словаря,
-    связь с отброшенным концом. Пригодятся `find_codes` и `canonical_name` из `assistant.infra.grounding`.
-    Функция не падает ни на каком ответе модели: одна повторная попытка, затем пустой результат.
+def normalize_relation(item: dict) -> dict:
     """
-    # TODO: запрос к модели, разбор JSON, проверки по тексту чанка и словарю
-    words = vocabulary()
-    codes_in_text = set(find_codes(chunk.text))
+    Исправляет направление связи, если модель вернула
+    субъект и объект в обратном порядке.
+    Допустимое направление определяется RELATION_SIGNATURES.
+    """
+    relation = dict(item)
 
+    relation_type = relation["type"]
+    expected = RELATION_SIGNATURES.get(relation_type)
+
+    if expected is None:
+        return relation
+
+    actual = (
+        relation["subject_type"],
+        relation["object_type"],
+    )
+
+    if actual == expected[::-1] and actual != expected:
+        relation["subject_type"], relation["object_type"] = (
+            relation["object_type"],
+            relation["subject_type"],
+        )
+
+        relation["subject"], relation["object"] = (
+            relation["object"],
+            relation["subject"],
+        )
+
+    return relation
+
+def request_extraction(
+    text: str,
+    chunk: Chunk,
+    llm: LLMClient,
+) -> dict | None:
+    """Запрашивает извлечение с одной повторной попыткой."""
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "user",
             "content": (
-                "Извлеки сущности и связи из следующего чанка.\n\n"
+                "Извлеки сущности и связи из следующего фрагмента чанка.\n\n"
+                "Контекстные строки могут содержать сведения о модели "
+                "и составе её узлов. Используй этот контекст при "
+                "извлечении связей HAS_PART.\n\n"
                 f"ID документа: {chunk.doc_id}\n"
                 f"ID чанка: {chunk.chunk_id}\n\n"
-                f"Текст чанка:\n{chunk.text}"
+                f"Текст фрагмента:\n{text}"
             ),
         },
     ]
-
-    data = None
 
     for _ in range(2):
         try:
@@ -209,76 +397,99 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
             data = parse_response(response.content)
 
             if data is not None:
-                break
+                return data
 
         except Exception:
-            data = None
+            pass
 
-    if data is None:
-        return empty_result(chunk)
+    return None
+
+def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
+    """Извлекает сущности и связи из чанка, объединяя результаты фрагментов."""
+    words = vocabulary()
+
+    codes_in_text = set(find_codes(chunk.text))
+
+    text_parts = split_text(chunk.text)
 
     result = empty_result(chunk)
 
     valid_entities: dict[str, Entity] = {}
+    valid_relations: dict[tuple[str, str, str], Relation] = {}
 
-    for item in data["entities"]:
-        entity = ground_entity(
-            item["type"],
-            item["name"],
-            chunk.text,
-            codes_in_text,
-            words,
-        )
+    for part_text in text_parts:
+        data = request_extraction(part_text, chunk, llm)
 
-        if entity is None:
-            result.dropped += 1
-            continue
+        if data is None:
+            return empty_result(chunk)
 
-        valid_entities[entity.node_id] = entity
+        for item in data["entities"]:
+            entity = ground_entity(
+                item["type"],
+                item["name"],
+                chunk.text,
+                codes_in_text,
+                words,
+            )
 
-    for item in data["relations"]:
-        subject_type = item["subject_type"]
-        relation_type = item["type"]
-        object_type = item["object_type"]
+            if entity is None:
+                result.dropped += 1
+                continue
 
-        if RELATION_SIGNATURES.get(relation_type) != (
-            subject_type,
-            object_type,
-        ):
-            result.dropped += 1
-            continue
+            valid_entities[entity.node_id] = entity
 
-        subject = ground_entity(
-            subject_type,
-            item["subject"],
-            chunk.text,
-            codes_in_text,
-            words,
-        )
+        for raw_relation in data["relations"]:
+            item = normalize_relation(raw_relation)
 
-        obj = ground_entity(
-            object_type,
-            item["object"],
-            chunk.text,
-            codes_in_text,
-            words,
-        )
+            subject_type = item["subject_type"]
+            relation_type = item["type"]
+            object_type = item["object_type"]
 
-        if subject is None or obj is None:
-            result.dropped += 1
-            continue
+            if RELATION_SIGNATURES.get(relation_type) != (
+                subject_type,
+                object_type,
+            ):
+                result.dropped += 1
+                continue
 
-        valid_entities[subject.node_id] = subject
-        valid_entities[obj.node_id] = obj
+            subject = ground_entity(
+                subject_type,
+                item["subject"],
+                chunk.text,
+                codes_in_text,
+                words,
+            )
 
-        result.relations.append(
-            Relation(
+            obj = ground_entity(
+                object_type,
+                item["object"],
+                chunk.text,
+                codes_in_text,
+                words,
+            )
+
+            if subject is None or obj is None:
+                result.dropped += 1
+                continue
+
+            valid_entities[subject.node_id] = subject
+            valid_entities[obj.node_id] = obj
+
+            relation = Relation(
                 subject=subject,
                 type=relation_type,
                 object=obj,
             )
-        )
+
+            relation_key = (
+                subject.node_id,
+                relation_type,
+                obj.node_id,
+            )
+
+            valid_relations[relation_key] = relation
 
     result.entities = list(valid_entities.values())
+    result.relations = list(valid_relations.values())
 
     return result
