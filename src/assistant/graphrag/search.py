@@ -47,7 +47,7 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
         for index, source in enumerate(sorted(anchors)):
             for target in sorted(anchors)[index + 1 :]:
                 for path in nx.all_simple_paths(undirected, source, target, cutoff=3):
-                    for first, second in zip(path, path[1:]):
+                    for first, second in zip(path, path[1:], strict=False):
                         if graph.has_edge(first, second):
                             selected.add((first, second))
                         if graph.has_edge(second, first):
